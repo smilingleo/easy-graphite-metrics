@@ -1,21 +1,8 @@
 var graphite = require('graphite-tcp');
 
-function getIntConfig (envName, defaultValue) {
-    if (process.env[envName]) {
-        let parsed = parseInt(process.env[envName]);
-        if (isNaN(parsed)) {
-            throw new Error(`Expect an integer value for ${envName} but the input is ${process.env[envName]}`);
-        }
-        return parsed;
-    } else {
-        return defaultValue;
-    }
-
-}
-
 var metric = graphite.createClient({
   host: process.env.GRAPHITE_HOST || "graphite.zeta.tools",
-  port: getIntConfig("GRAPHITE_PORT", 2003),
+  port: parseInt(process.env.GRAPHITE_PORT || "2003"),
   family: '4',
   prefix: process.env.GRAPHITE_PREFIX || "my-app",
   verbose: false,
@@ -24,36 +11,39 @@ var metric = graphite.createClient({
 });
 
 var hostName = '';
-var PROD_MODE = process.env.PROD_MODE && process.env.PROD_MODE.toLowerCase() == "true" ? true : false;
 
 function getHostname() {
     return new Promise(function(resolve, reject) {
-        if (PROD_MODE) {
-            var http = require("http");
-            http.get("http://169.254.169.254/latest/meta-data/local-ipv4", function(res) {
-                if (res.statusCode != 200) {
-                    resolve(require('os').hostname());
-                    return;
-                }
-                var rawData = '';
-                res.on('data', function(chunk){ rawData += chunk });
-                res.on('end', function () {
-                    // replace the dot since it's a deliminator of graphite metrics groups.
-                    resolve(rawData.replace(/\./g, "-"));
-                });
+        var http = require("http");
+        http.get({
+            hostname: '169.254.169.254',
+            port: 80,
+            path: '/latest/meta-data/local-ipv4',
+            method: 'GET',
+            timeout: 3000
+          }, function(res) {
+            if (res.statusCode !== 200) {
+                resolve(require('os').hostname());
+                return;
+            }
+            var rawData = '';
+            res.on('data', function(chunk){ rawData += chunk });
+            res.on('end', function () {
+                // replace the dot since it's a deliminator of graphite metrics groups.
+                resolve(rawData.replace(/\./g, "-"));
             });
-
-        } else {
+        }).on('error', function(e) {
             resolve(require('os').hostname());
-        }
+        });
     });
 }
 
 function withHostname (callback) {
-    if (hostName == '') {
+    if (hostName === '') {
         getHostname()
             .then(function(hName) {
-                hostName = hName; // to cache the result
+                // cache the result
+                hostName = hName;
                 callback(hName);
             })
     } else {
@@ -74,19 +64,41 @@ function putMetric (name, value){
     });
 }
 
-function meter (name, callback){
+function meter(name, callback) {
     withHostname(function(hostname){
-        var start = Date.now();
-        callback();
-        var execTime = Date.now() - start;
-        metric.put(`${hostname}.${name}`, execTime);
+        var argType = typeof callback;
+        if (argType === 'undefined' || argType === null) {
+            metric.put(`${hostname}.${name}`, 0);
+        }else if (argType === 'function') {
+            var begin = Date.now();
+            callback();
+            var execTime = Date.now() - begin;
+            metric.put(`${hostname}.${name}`, execTime);
+        } else if (argType === 'number') {
+            metric.put(`${hostname}.${name}`, callback);
+        } else if (argType === 'object' && callback.__proto__ === Promise.prototype) {
+            var begin = Date.now();
+            callback.then(function() {
+                var execTime = Date.now() - begin;
+                metric.put(`${hostname}.${name}`, execTime);
+            }, function(e) {
+                var execTime = Date.now() - begin;
+                metric.put(`${hostname}.${name}`, execTime);
+            });
+        } else {
+            throw new Error("invalid argument type, expect one of 'number', function, promise.")
+        }
     });
 }
 
 var metrics = {
-    meter : meter,
     counter : function(name) {addMetric(name, 1);},
-    put: putMetric
+    put: putMetric,
+    add: addMetric,
+    meter: meter,
+
+    __test_withHostname: withHostname,
+    __test_getHostname: getHostname
 }
 
 exports = module.exports = metrics;
